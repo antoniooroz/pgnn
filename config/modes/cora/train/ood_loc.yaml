@@ -1,0 +1,6 @@
+custom_name: ood_loc
+
+# OOD LOC Settings
+ood: loc
+loc_remove_edges: True
+ood_eval_during_training: False

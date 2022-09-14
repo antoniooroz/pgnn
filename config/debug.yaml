@@ -1,0 +1,6 @@
+seeds_num: 1
+num_iters: 2
+learning_rate: 
+  - 0.01
+reg_lambda: 
+  - 0.0005

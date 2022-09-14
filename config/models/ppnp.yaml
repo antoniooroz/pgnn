@@ -1,0 +1,9 @@
+mode: PPNP
+max_epochs: 
+  - 1000
+learning_rate: 
+  - 0.01
+reg_lambda: 
+  - 0.0005
+drop_prob: 0.5
+custom_name: only_model

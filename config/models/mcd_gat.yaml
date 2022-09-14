@@ -1,0 +1,13 @@
+mode: MCD-GAT
+max_epochs: 
+  - 1000
+learning_rate: 
+  - 0.01
+reg_lambda: 
+  - 0.0005
+drop_prob: 0.5
+hiddenunits: [8]
+gat_heads_per_layer: [8]
+gat_add_skip_connections: False
+uncertainty: variance_between_samples_per_class_summed
+custom_name: only_model
