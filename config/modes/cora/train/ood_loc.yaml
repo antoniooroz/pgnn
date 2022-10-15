@@ -1,6 +1,7 @@
 custom_name: ood_loc
-
-# OOD LOC Settings
-ood: loc
-loc_remove_edges: True
-ood_eval_during_training: False
+experiment:
+  dataset: CORA_ML
+  ood: LOC
+  ood_loc_remove_edges: True
+training:
+  ood_eval_during_training: False

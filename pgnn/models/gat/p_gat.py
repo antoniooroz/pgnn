@@ -3,34 +3,34 @@ import torch.nn as nn
 import pyro
 from pyro.nn import PyroModule, PyroParam, PyroSample
 from pgnn.base import P_Base
+from pgnn.base.network_mode import NetworkMode
+from pgnn.configuration.configuration import Configuration
+from pgnn.data.model_input import ModelInput
+from pgnn.result.model_output import ModelOutput
 from pgnn.utils import get_device, get_edge_indices, get_self_edge_indices
 import pyro.distributions as dist
 from .gat import GAT
 
 class P_GAT(P_Base):
-
-    def __init__(self, nfeatures, nclasses, adj_matrix, config):
+    def __init__(self, nfeatures: int, nclasses: int, configuration: Configuration, adj_matrix: torch.Tensor):
         super().__init__()
+        self.configuration = configuration
+        self.nclasses = nclasses
         self.nfeatures = nfeatures
-        self.nclasses = nclasses 
-        self.config = config
-        self.return_sites = ("obs", "final_logits", "_RETURN", "edge_indices")
-
-        if self.config.mode not in ["P-PROJ-GAT", "Mixed-PROJ-GAT"]:
-            self.return_sites += tuple(["edge_scores"])
-
-
-        self.model = GAT(
+        self.adj_matrix = adj_matrix
+        
+        self.set_model(GAT(
             nfeatures=nfeatures,
             nclasses=nclasses,
-            config=config,
+            config=configuration,
             adj_matrix=adj_matrix
             )
+        )
 
-        self.pyronize(self.model)
-
-    def forward(self, attr_matrix, idx, y=None):
-        final_logits = self.model(attr_matrix, idx)
+    def forward(self, model_input: ModelInput) -> dict[NetworkMode, ModelOutput]:
+        raise NotImplementedError()
+        """
+        model_outputs = self.model(model_input)
 
         pyro.deterministic("final_logits", final_logits)
 
@@ -45,3 +45,4 @@ class P_GAT(P_Base):
             obs = pyro.sample("obs", dist.Categorical(logits=final_logits), obs=y)
 
         return final_logits
+        """

@@ -1,24 +1,22 @@
 from typing import List
-import torch.nn as nn
+import torch
+
+from pgnn.configuration.configuration import Configuration
 from .ppnp import PPNP
 from pgnn.base import P_Base
 
 class P_PPNP(P_Base):
-    def __init__(self, nfeatures: int, nclasses: int, config, hiddenunits: List[int], drop_prob: float, propagation: nn.Module):
+    def __init__(self, nfeatures: int, nclasses: int, configuration: Configuration, adj_matrix: torch.Tensor):
         super().__init__()
-        self.config = config
+        self.configuration = configuration
         self.nclasses = nclasses
         self.nfeatures = nfeatures
-
-        self.return_sites = ("obs", "final_logits", "_RETURN")
+        self.adj_matrix = adj_matrix
         
-        self.model = PPNP(
+        self.set_model(PPNP(
             nfeatures=nfeatures,
             nclasses=nclasses,
-            config=config,
-            hiddenunits=hiddenunits,
-            drop_prob=drop_prob,
-            propagation=propagation
+            configuration=configuration,
+            adj_matrix=adj_matrix
             )
-
-        self.pyronize(self.model)
+        )

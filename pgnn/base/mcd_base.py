@@ -1,8 +1,13 @@
 from pgnn.base import Base
-from typing import List
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from pgnn.base.network_mode import NetworkMode
+
+from pgnn.configuration.configuration import Configuration
+from pgnn.configuration.model_configuration import ModelType
+from pgnn.data.model_input import ModelInput
+from pgnn.result.model_output import ModelOutput
+import pgnn.base.uncertainty_estimation as UE
+import pgnn.base.network_uncertainty_combination as NUC
 
 from .base import Base
 
@@ -10,41 +15,71 @@ import pgnn.base.uncertainty_estimation as UE
 
 
 class MCD_Base(Base):
-    
-    def __init__(self, nfeatures, nclasses, config):
+    def __init__(self, nfeatures: int, nclasses: int, configuration: Configuration):
         super().__init__()
         self.nfeatures = nfeatures
         self.nclasses = nclasses
-        self.config = config
-        self.model = None
+        self.configuration = configuration
+        self.model: Base = None
     
-    def forward(self, attr_matrix: torch.sparse.FloatTensor, idx: torch.LongTensor):
-        return self.model.forward(attr_matrix, idx)
+    def forward(self, model_input: ModelInput) -> dict[NetworkMode, ModelOutput]:
+        return self.model.forward(model_input)
 
-    def get_predictions(self, attr_matrix, idx):
-        idx = idx.to(attr_matrix.device)
+    def predict(self, model_input: ModelInput) -> dict[NetworkMode, ModelOutput]:        
+        model_output_samples: dict[NetworkMode, list[ModelOutput]] = {
+            NetworkMode.ISOLATED: [],
+            NetworkMode.PROPAGATED: []
+        }
+        model_outputs: dict[NetworkMode, ModelOutput] = {}
         
-        logits = []
-        for _ in range(self.config.prediction_samples_num):
-            final_logits = self.forward(attr_matrix, idx)
-            logits.append(final_logits.unsqueeze(0))
+        nsamples = self.configuration.model.samples_training        
         
-        logits = torch.cat(logits, dim=0).to(idx.device)
+        # Generate Samples
+        for _ in range(nsamples):
+            output_per_mode = self.forward(model_input)
+            for key in model_output_samples.keys():
+                model_output_samples[key].append(output_per_mode[key].unsqueeze(0))
         
-        if self.config.pred_score=="softmax": 
-            probs_all = F.softmax(logits, dim=-1)
-            probs_mean = (torch.sum(probs_all, dim=0) / self.config.prediction_samples_num).squeeze(0)    
-            preds = probs_mean.max(-1).indices
-            epist = UE.get_uncertainty(self.config, self.config.uncertainty, probs_all=probs_all, probs_mean=probs_mean, preds=preds, logits=logits)
+        # Accumulate samples and calculate outputs
+        for key in model_output_samples.keys():
+            model_output = ModelOutput.cat_list(model_output_samples[key])
+            all_softmax_scores = model_output.softmax_scores
+            mean_softmax_scores = (torch.sum(all_softmax_scores, dim=0) / nsamples).squeeze(0)    
+            max_probabilities = mean_softmax_scores.max(dim=-1)
+            
+            model_output.softmax_scores = mean_softmax_scores
+            model_output.predicted_classes = max_probabilities.indices
+            model_output.epistemic_uncertainties = UE.get_uncertainty(
+                configuration=self.configuration, 
+                uncertainty_metric=self.configuration.model.uncertainty_estimation, probs_all=all_softmax_scores, 
+                probs_mean=mean_softmax_scores, 
+                preds=max_probabilities.indices
+            )
 
-            alea = UE.get_uncertainty(self.config, "probability", probs_all=probs_all, probs_mean=probs_mean, preds=preds, logits=logits)
-        else: 
-            raise NotImplementedError()
+            model_output.aleatoric_uncertainties = UE.get_uncertainty(
+                configuration=self.configuration, 
+                uncertainty_metric='probability', probs_all=all_softmax_scores, 
+                probs_mean=mean_softmax_scores, 
+                preds=max_probabilities.indices
+            )
+            
+            model_outputs[key] = model_output
+            
+                
+        NUC.combine(
+            combinationMethod=self.configuration.model.network_combination,
+            model_outputs=model_outputs
+        )
         
-        return probs_mean, preds, epist, alea
+        return model_outputs
     
-    def load_model(self, name, attr_mat):
-        self.model.load_model(name[name.index("-")+1:], attr_mat)
+    def load_model(self, mode: ModelType, name: str, seed: int, iter: int):
+        self.model.load_model(
+            mode=ModelType.get_base_type(mode),
+            name=name,
+            seed=seed,
+            iter=iter
+        )
         
     def log_weights(self):
         return self.model.log_weights()
@@ -55,7 +90,8 @@ class MCD_Base(Base):
         Last visited: 14.06.2022
         """
         super().eval()
-        if self.config.mode.startswith('MCD-'):
+        # is_mcd because DropEdge also uses MCD base class but doesn't utilize normal dropout in eval
+        if self.configuration.model in ModelType.mcds():
             for m in self.model.modules():
-                if m.__class__.__name__.startswith('Dropout') or m.__class__.__name__.startswith('MixedDropout'):
+                if m.__class__.__name__.startswith('Dropout'):
                     m.train()

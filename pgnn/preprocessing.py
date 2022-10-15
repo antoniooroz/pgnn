@@ -11,6 +11,10 @@ import copy
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
+import torch
+
+from pgnn.configuration.training_configuration import Phase
+from pgnn.utils.utils import get_device
 
 
 def gen_seeds(size: int = None) -> np.ndarray:
@@ -49,7 +53,7 @@ def train_stopping_split(
 
 def gen_splits(
         labels: np.ndarray, idx_split_args: Dict[str, int],
-        test: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        test: bool = False) -> Dict[Phase, torch.LongTensor]:
     all_idx = np.arange(len(labels))
     known_idx, unknown_idx = known_unknown_split(
             all_idx, idx_split_args['nknown'])
@@ -62,7 +66,12 @@ def gen_splits(
         val_idx = unknown_idx
     else:
         val_idx = exclude_idx(known_idx, [train_idx, stopping_idx])
-    return train_idx, stopping_idx, val_idx
+        
+    return {
+        Phase.TRAINING: torch.LongTensor(train_idx).to(get_device()),
+        Phase.STOPPING: torch.LongTensor(stopping_idx).to(get_device()),
+        Phase.VALTEST: torch.LongTensor(val_idx).to(get_device())
+    }
 
 def normalize_attributes(attr_matrix):
     epsilon = 1e-12

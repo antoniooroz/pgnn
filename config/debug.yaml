@@ -1,6 +1,7 @@
-seeds_num: 1
-num_iters: 2
-learning_rate: 
-  - 0.01
-reg_lambda: 
-  - 0.0005
+training:
+  max_epochs:
+    TRAINING: 10
+experiment:
+  iterations_per_seed: 1
+  seeds:
+    end: 2

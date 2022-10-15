@@ -6,282 +6,200 @@
 # URL: https://github.com/gasteigerjo/ppnp
 ##############################################################
 
-from typing import Type, Tuple
 import time
 import logging
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
-from pgnn.base.propagation import PPRPowerIterationAlternative, AttentionPropagation, AttentionPropagation2
+from pgnn.base.base import Base
+from pgnn.base.network_mode import NetworkMode
+from pgnn.configuration.configuration import Configuration
+from pgnn.configuration.experiment_configuration import OOD, ExperimentMode
+from pgnn.configuration.training_configuration import Phase
 from pgnn.logger import Logger
 import tqdm
-
-import copy
-import os
-from pgnn.models.gpn.gpn_fns.utils.config import ModelConfiguration
+from pgnn.data import Data, ModelInput
 
 from pgnn.ood import OOD_Experiment
-from pgnn.base import PPRPowerIteration
+from pgnn.result.result import Info, Results
+
+import pgnn.models as models
+from pgnn.utils.utils import matrix_to_torch
 
 from .data.sparsegraph import SparseGraph
-from .preprocessing import gen_seeds, gen_splits, normalize_attributes
-from pgnn.utils import EarlyStopping, stopping_args, get_device, matrix_to_torch, final_run
+from .preprocessing import gen_seeds, gen_splits
+from pgnn.utils import EarlyStopping, get_device, final_run
 
 import pyro
-from pyro.infer.autoguide import AutoDiagonalNormal
-from pyro.infer import SVI, Trace_ELBO, Predictive
 
-def get_dataloaders(idx, labels_np, oods_all, batch_size=None):
-    labels = torch.LongTensor(labels_np)
+def get_dataloaders(idx, labels, oods_all, batch_size=None):
+    # MPS fix -> repeats only one item in dataloader...
+    if torch.backends.mps.is_available():
+        device = 'cpu'
+    else:
+        device = get_device()
+    
     if batch_size is None:
         batch_size = max((val.numel() for val in idx.values()))
-    datasets = {phase: TensorDataset(ind, labels[ind], oods_all[ind]) for phase, ind in idx.items()}
+    datasets = {phase: TensorDataset(ind.to(device), labels[ind].to(device), oods_all[ind].to(device)) for phase, ind in idx.items()}
     dataloaders = {phase: DataLoader(dataset=dataset, batch_size=batch_size, shuffle=True)
                    for phase, dataset in datasets.items()}
     return dataloaders
 
 
-def train_model(
-        name: str, model_class: Type[nn.Module], graph: SparseGraph, model_args: dict,
-        reg_lambda: float, model_name: str, iteration: int, config, logger: Logger,
-        idx_split_args: dict = {'ntrain_per_class': 20, 'nstopping': 500, 'nknown': 1500, 'seed': 2413340114},
-        stopping_args: list = [stopping_args],
-        test: bool = False, device: str = get_device(),
-        torch_seed: int = None, print_interval: int = 10) -> Tuple[nn.Module, dict]:
-    labels_all = graph.labels.astype('int64')
-    idx_np = {}
-    idx_np['train'], idx_np['stopping'], idx_np['valtest'] = gen_splits(labels_all, idx_split_args, test=False)
+def train_model(graph: SparseGraph, seed: int, iteration: int,
+                logger: Logger, configuration: Configuration = None):
+    device = get_device()
     
-    idx_all = {key: torch.LongTensor(val) for key, val in idx_np.items()}
-    oods_all = torch.zeros(labels_all.shape)
-    
-    attr_matrix = graph.attr_matrix.copy()
-    
-    if config.binary_attributes:
-        attr_matrix[attr_matrix > 0] = 1
-
-    if config.normalize_attributes == 'default':
-        attr_mat_norm_np = normalize_attributes(attr_matrix)
-        attr_mat_norm = matrix_to_torch(attr_mat_norm_np).to(device)
-    elif config.normalize_attributes == 'div_by_sum':
-        attr_mat_norm = matrix_to_torch(attr_matrix).to(device)
-        attr_mat_norm = attr_mat_norm / (attr_mat_norm.sum(dim=-1).unsqueeze(-1) + 1e-10)
-    elif config.normalize_attributes == 'no':
-        attr_mat_norm = matrix_to_torch(attr_matrix).to(device)
-    else:
-        raise NotImplementedError()
+    # Data
+    idx_all = gen_splits(
+        labels=graph.labels.astype('int64'), 
+        idx_split_args={
+            'ntrain_per_class': configuration.experiment.datapoints_training_per_class,
+            'nstopping': configuration.experiment.datapoints_stopping,
+            'nknown': configuration.experiment.datapoints_known,
+            'seed': seed
+        }, 
+        test=configuration.experiment.seeds.experiment_mode==ExperimentMode.TEST
+    )
+    labels_all = torch.LongTensor(graph.labels.astype('int64')).to(device)
+    oods_all = torch.zeros(labels_all.shape).to(device)
+    feature_matrix = graph.attr_matrix.clone().detach().to(device)
+    adjacency_matrix = matrix_to_torch(graph.adj_matrix)
     
     # OOD
-    ood_experiment = None
-    if config.ood != "none":
-        ood_experiment = OOD_Experiment(config, graph.adj_matrix, attr_mat_norm, idx_all, labels_all, oods_all)
-        adj_matrix, attr_mat_norm, idx_all, labels_all, oods_all = ood_experiment.setup()
+    if configuration.experiment.ood != OOD.NONE:
+        adjacency_matrix, feature_matrix, idx_all, labels_all, oods_all = OOD_Experiment.setup(
+            configuration=configuration, 
+            adjacency_matrix=adjacency_matrix, 
+            feature_matrix=feature_matrix, 
+            idx_all=idx_all, 
+            labels_all=labels_all,
+            oods_all=oods_all
+        )
+    
+    # OOD-Setting: Remove left-out classes
+    if configuration.experiment.ood_loc_remove_classes:
+        nclasses = torch.max(labels_all[oods_all==0]).cpu().item() + 1
     else:
-        adj_matrix = graph.adj_matrix
-        
+        nclasses = torch.max(labels_all).cpu().item() + 1
+    
+    nfeatures = feature_matrix.shape[1]        
 
-    logging.log(21, f"{model_class.__name__}: {model_args}")
-    if torch_seed is None:
-        torch_seed = gen_seeds()
-    torch.manual_seed(seed=torch_seed)
+    # Torch Seed and Logging
+    logging.log(21, f"Training Model: {configuration.model.type.name}")
+    torch_seed = gen_seeds()
+    torch.manual_seed(seed=torch_seed) # TODO: Maybe make reproducible aswell
     logging.log(22, f"PyTorch seed: {torch_seed}")
-
-    nfeatures = attr_matrix.shape[1]
     
-    if config.remove_loc_classes:
-        nclasses = max(labels_all[oods_all==0]) + 1
-    else:
-        nclasses = max(labels_all) + 1
+    # Model
+    model = getattr(models, configuration.model.type.value)(
+        configuration=configuration,
+        nfeatures=nfeatures,
+        nclasses=nclasses,
+        adj_matrix=adjacency_matrix,
+        training_labels=labels_all[idx_all[Phase.TRAINING]] # GPN parameter
+    ).to(device)
+    model.init(torch_seed, configuration.custom_name, iteration, seed)
+    
+    if configuration.load is not None:
+        model.load_model(
+            mode=configuration.model.type,
+            name=configuration.custom_name,
+            seed=seed,
+            iter=iteration
+        )
         
-    if config.mode=="PPNP" or config.mode=="MCD-PPNP" or config.mode=="P-PPNP" or config.mode=="Mixed-PPNP":
-        #prop_appnp = AttentionPropagation(adj_matrix, alpha=config.alpha, niter=10, feature_size=nfeatures)
-        prop_appnp = PPRPowerIteration(adj_matrix, alpha=config.alpha, niter=10)
-        model_args = {**model_args, "nfeatures": nfeatures, "nclasses": nclasses, "config": config, "propagation": prop_appnp}
-    elif config.mode in ["GCN", "MCD-GCN", "P-GCN", "Mixed-GCN", "DE-GCN"]:
-        model_args = {**model_args, "nfeatures": nfeatures, "nclasses": nclasses, "config": config, "adj_matrix": adj_matrix}
-    elif config.mode=="GPN":
-        config.gpn_model["dim_features"]=nfeatures
-        config.gpn_model["num_classes"]=nclasses
-        model_args = {"params": ModelConfiguration(**config.gpn_model), "graph": graph, "training_labels": labels_all[idx_all["train"]], "config": config}
-    elif config.mode in ["GAT", "P-GAT", "P-PROJ-GAT", "P-ATT-GAT", "Mixed-GAT", "Mixed-PROJ-GAT", "Mixed-ATT-GAT", "MCD-GAT"]:
-        model_args = {"nfeatures": nfeatures, "nclasses": nclasses, "config": config, "adj_matrix": adj_matrix}
-    else:
-        raise NotImplementedError()
-    
-    model = model_class(**model_args).to(device)
-
     logger.watch(model)
-    
-    model.training_init(torch_seed, model_name, iteration, idx_split_args['seed'])
 
+    # Dataloaders, etc.
     dataloaders = get_dataloaders(idx_all, labels_all, oods_all)
     
-    early_stopping_list = []
-    for era in range(config.number_of_eras):
-        early_stopping_list.append(EarlyStopping(model, **stopping_args[era]))
-    
-    if ood_experiment is not None:
-        ood_experiment.setup_dataloaders(dataloaders)
-
-    epoch_stats = {'train': {}, 'stopping': {}}
-
-    start_time = time.time()
-    last_time = start_time
-    
-    best_stopping_value = None
-    best_model_parameters = None
-
     pyro.clear_param_store()
     
-    model.set_era(0)
-    early_stopping = early_stopping_list[0]
+    early_stopping = EarlyStopping(
+        model=model,
+        stop_variable=configuration.training.early_stopping_variable
+    )
 
-    if config.load is not None:
-        model.load_model(config.mode + ' [' + config.load + '] [' + str(idx_split_args['seed']) + '] [' + str(iteration) + ']' + '.save', attr_mat_norm)
-        
-    if not config.skip_training:
-        for era in range(config.number_of_eras):
-            early_stopping = early_stopping_list[era]
-            pbar = tqdm.tqdm(range(early_stopping.max_epochs))
-            model.set_era(era)
+    # Training
+    start_time = time.time()
+    if not configuration.training.skip_training:
+        for training_phase in Phase.training_phases():
+            if training_phase not in configuration.training.phases:
+                continue
+            pbar = tqdm.tqdm(range(configuration.training.max_epochs[training_phase]))
+
+            early_stopping.init_for_training_phase(
+                enabled=configuration.training.early_stopping[training_phase],
+                patience=configuration.training.patience[training_phase],
+                max_epochs=configuration.training.max_epochs[training_phase]
+            )
+            
             for epoch in pbar:
-                for phase in epoch_stats.keys():
-                    running_loss = torch.tensor(0.0).to(get_device())
-                    running_confidence_all = torch.tensor(0.0).to(get_device())
-                    running_confidence_correct = torch.tensor(0.0).to(get_device())
-                    running_confidence_false = torch.tensor(0.0).to(get_device())
-                    running_datapoints_correct = torch.tensor(0.0).to(get_device())
-                    running_datapoints_false = torch.tensor(0.0).to(get_device())
-                    running_probs = []
+                resultsPerPhase: dict[Phase, Results] = {}
+                for phase in Phase.get_phases(training_phase):
+                    start_time_phase = time.time()
+                    results = Results()
                     
+                    dataloader_phase = Phase.TRAINING if phase in Phase.training_phases() else phase
                     ########################################################################
                     # Training Step                                                        #
                     ########################################################################
-                    for idx, labels, oods in dataloaders[phase]:
-                        idx = idx.to(device)
-                        labels = labels.to(device)
-
-                        loss, probs, confidence_all, confidence_correct, confidence_false, datapoints_correct, datapoints_false = model.training_step(phase if epoch > 0 else "before_training", attr_mat_norm, idx, labels, oods)
+                    for idx, labels, oods in dataloaders[dataloader_phase]:
+                        data = Data(
+                            model_input=ModelInput(features=feature_matrix, indices=idx.to(device)),
+                            labels=labels.to(device),
+                            ood_indicators=oods.to(device)
+                        )
                         
-                        running_loss += loss * idx.size(0)
-
-                        running_confidence_all += confidence_all
-                        running_confidence_correct += confidence_correct
-                        running_confidence_false += confidence_false
-                        running_datapoints_correct += datapoints_correct
-                        running_datapoints_false += datapoints_false
-                        running_probs.append(probs)
+                        results += model.step(phase if epoch > 0 else Phase.INIT, data)
                         
                     ########################################################################
                     # Logging                                                              #
                     ########################################################################
-                    duration = time.time() - last_time
+                    results.info = Info(
+                        duration=time.time() - start_time_phase,
+                        seed=seed,
+                        iteration=iteration
+                    )
                     
-                    log_loss =  (running_loss / (running_datapoints_correct+running_datapoints_false)).item()
-                    log_acc = (running_datapoints_correct / (running_datapoints_correct+running_datapoints_false)).item()
-                    log_conf_correct = (running_confidence_correct / running_datapoints_correct).item()
-                    log_conf_false = (running_confidence_false / running_datapoints_false).item()
-                    log_conf_all = (running_confidence_all / (running_datapoints_correct+running_datapoints_false)).item()
-                    log_duration = duration
-                    log_seed = idx_split_args['seed']
-                    log_iteration = iteration        
-
-                    ########################################################################
-                    # OOD Logs                                                             #
-                    ########################################################################
-                    ood_logs = None
-                    if ood_experiment and config.ood_eval_during_training:
-                        ood_logs = ood_experiment.run(model, device, phase)
-                        
-                        epoch_stats[phase]['ood'] = ood_logs["auc_roc_score"]
-                        epoch_stats[phase]['ood_wo_network'] = ood_logs["auc_roc_score_wo_network_effects"]
-                    
-                    ########################################################################
-                    # Saving Logs                                                          #
-                    ########################################################################
-
-                    epoch_stats[phase]['loss'] = log_loss
-                    epoch_stats[phase]['acc'] = log_acc
-                    
+                    resultsPerPhase[phase] = results
                     logger.logStep(
                         phase=phase, 
-                        logs={
-                            "loss": log_loss,
-                            "acc": log_acc,
-                            "conf_correct": log_conf_correct,
-                            "conf_false": log_conf_false,
-                            "conf_all": log_conf_all,
-                            "duration": log_duration,
-                            "seed": log_seed,
-                            "iter": log_iteration,
-                        }, 
-                        ood=ood_logs,
+                        results=results,
                         weights=model.log_weights()
                     )
-                        
-                    last_time = time.time()
+                    
                 
-                pbar.set_postfix({'stopping_acc': epoch_stats['stopping']['acc']})
+                pbar.set_postfix({'stopping acc': '{:.3f}'.format(resultsPerPhase[Phase.STOPPING].networkModeResults[NetworkMode.PROPAGATED].accuracy)})
                 ########################################################################
                 # Early Stopping                                                       #
                 ########################################################################
-                if config.use_early_stopping[era]:
-                    if epoch_stats['stopping'][early_stopping.stop_vars[0]] != None and (best_stopping_value == None or early_stopping.comp_ops[0](epoch_stats['stopping'][early_stopping.stop_vars[0]], best_stopping_value)):
-                        best_stopping_value = epoch_stats['stopping'][early_stopping.stop_vars[0]]
-                        best_model_parameters = model.custom_state_dict(best_stopping_value)
-                
-                    if len(early_stopping.stop_vars) > 0:
-                        stop_vars = [epoch_stats['stopping'][key]
-                                    for key in early_stopping.stop_vars]
-                        if early_stopping.check(stop_vars, epoch):
-                            break
-                    
+                if early_stopping.check_stop(resultsPerPhase[Phase.STOPPING].networkModeResults[NetworkMode.PROPAGATED], epoch):
+                    break           
                     
             # Load best model parameters from era
-            if config.use_early_stopping[era]:
-                model.load_model_from_state_dict(best_model_parameters, attr_mat_norm)
-            else:
-                best_stopping_value = epoch_stats['stopping'][early_stopping.stop_vars[0]]
-                best_model_parameters = model.custom_state_dict(best_stopping_value)
+            early_stopping.load_best()
 
         runtime = time.time() - start_time
         runtime_perepoch = runtime / (epoch + 1)
         
         # Save best model
-        model.save_model(best_model_parameters)
-        model.load_model_from_state_dict(best_model_parameters, attr_mat_norm)
+        model.save_model()
         
         pbar.close()
     else:
-        epoch, early_stopping.best_epoch, runtime, runtime_perepoch = 0, 0, 0, 0
+        epoch, runtime, runtime_perepoch = 0, 0, 0
 
-    ########################################################################
-    # After Training                                                       #
-    ########################################################################
+    # Evaluation
     model.set_eval()
     
-    # Stats
-    train_stats = final_run(model, attr_mat_norm, idx_all['train'], labels_all, oods_all)
-    stopping_stats = final_run(model, attr_mat_norm, idx_all['stopping'], labels_all, oods_all)
-    valtest_stats = final_run(model, attr_mat_norm, idx_all['valtest'], labels_all, oods_all)
+    resultsPerPhase = final_run(model, feature_matrix, idx_all, labels_all, oods_all)
     
-    # OOD Experiments
-    ood_results_train, ood_results_stopping, ood_results_valtest = None, None, None
-    if ood_experiment is not None:
-        ood_results_train = ood_experiment.run(model, device, "train")
-        ood_results_stopping = ood_experiment.run(model, device, "stopping")
-        ood_results_valtest = ood_experiment.run(model, device, "valtest")
-    
-    # Logging
-    weights = model.log_weights()
-    logger.logEval(phase='train', logs=train_stats, ood=ood_results_train, weights=weights)
-    logger.logEval(phase='stopping', logs=stopping_stats, ood=ood_results_stopping, weights=weights)
-    logger.logEval(phase='valtest', logs=valtest_stats, ood=ood_results_valtest, weights=weights)
-    
+    logger.logEval(resultsPerPhase=resultsPerPhase, weights=model.log_weights())
     logger.logAdditionalStats({
         'last_epoch': epoch,
-        'best_epoch': early_stopping.best_epoch,
+        'best_epoch': early_stopping.best.epoch,
         'runtime': runtime,
         'runtime_per_epoch': runtime_perepoch
     })

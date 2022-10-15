@@ -1,5 +1,7 @@
 import math
 import numpy as np
+
+from pgnn.configuration.configuration import Configuration
 from .base_module import BaseModule
 from pgnn.logger import LogWeight, LogWeightValue
 import scipy.sparse as sp
@@ -11,7 +13,6 @@ import torch_geometric.utils as tu
 import wandb
 from pyro.nn import PyroModule, PyroParam, PyroSample
 import pyro.distributions as dist
-from .mixed_dropout import MixedDropout
 
 from pgnn.inits import glorot, zeros
 
@@ -23,8 +24,8 @@ class GraphConvolution(BaseModule):
     # Title: Graph Convolutional Networks
     # URL: https://github.com/tkipf/gcn
     ##############################################################
-    def __init__(self, input_dim, output_dim, config, bias=False, activation=nn.ReLU(), dropout=0, name=""):
-        super().__init__(input_dim=input_dim, output_dim=output_dim, config=config, name=name)
+    def __init__(self, input_dim, output_dim, configuration: Configuration, bias=False, activation=nn.ReLU(), dropout=0, name=""):
+        super().__init__(input_dim=input_dim, output_dim=output_dim, configuration=configuration, name=name)
 
         self.weight = nn.Parameter(glorot([input_dim, output_dim]))
         
@@ -34,7 +35,7 @@ class GraphConvolution(BaseModule):
             self.bias = None
 
         self.activation = activation
-        self.dropout = MixedDropout(p=dropout) if dropout != 0 else lambda x: x
+        self.dropout = nn.Dropout(p=dropout) if dropout != 0 else lambda x: x
     
     def forward(self, input):
         x, support = input

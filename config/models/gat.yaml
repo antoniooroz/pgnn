@@ -1,13 +1,13 @@
-mode: GAT
-max_epochs: 
-  - 1000
-learning_rate: 
-  - 0.01
-reg_lambda: 
-  - 0.0005
-drop_prob: 0.5
-hiddenunits: [8]
-gat_heads_per_layer: [8]
-gat_add_skip_connections: False
-
-custom_name: only_model
+model:
+  type: GAT
+  hidden_layer_size:
+    - 8
+  gat_hidden_layers_heads:
+    - 8
+  gat_skip_connections: False
+training:
+  learning_rate: 
+    TRAINING: 0.1
+  reg_lambda: 
+    TRAINING: 0.0
+  drop_prob: 0.5

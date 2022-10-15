@@ -1,19 +1,19 @@
-mode: P-PROJ-GAT
-max_epochs: [1000]
-learning_rate: [0.03]
-training_samples_num: 3
-drop_prob: 0
-initial_var: 1
-guide_init_scale: 0.01
-stopping_var: loss
-uncertainty: variance_between_samples_per_class_summed
-train_mean: True
-train_var: True
-
-vectorize: True
-
-hiddenunits: [8]
-gat_heads_per_layer: [8]
-gat_add_skip_connections: False
-
-custom_name: only_model
+model:
+  type: P_PROJ_GAT
+  samples_training: 3
+  initial_var: 1
+  guide_init_scale: 0.1
+  uncertainty: variance_between_samples_per_class_summed
+  train_mean: True
+  train_var: True
+  hidden_layer_size:
+    - 8
+  gat_hidden_layers_heads:
+    - 8
+  gat_skip_connections: False
+training:
+  learning_rate: 
+    TRAINING: 0.03
+  reg_lambda: 
+    TRAINING: 0.0
+  drop_prob: 0

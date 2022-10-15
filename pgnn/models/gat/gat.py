@@ -8,26 +8,31 @@
 
 import torch
 import torch.nn as nn
+from pgnn.base.network_mode import NetworkMode
+from pgnn.configuration.configuration import Configuration
+from pgnn.configuration.model_configuration import ModelType
+from pgnn.data.model_input import ModelInput
 
 from pgnn.logger import LogWeight, LogWeightValue
 from pgnn.base import Base, Linear
+from pgnn.result.model_output import ModelOutput
 from pgnn.utils import get_device, get_edge_indices, get_self_edge_indices
 from pyro.nn import PyroModule, PyroParam, PyroSample
 import pyro.distributions as dist
 
 
 class GAT(Base):
-    def __init__(self, nfeatures, nclasses, adj_matrix, config):
+    def __init__(self, nfeatures: int, nclasses: int, configuration: Configuration, adj_matrix: torch.Tensor):
         super().__init__()
+        self.configuration = configuration
+        self.nclasses = nclasses
         self.nfeatures = nfeatures
-        self.nclasses = nclasses 
-        self.config = config
 
         self.self_edge_indices = get_self_edge_indices(adj_matrix)
         self.edge_indices = torch.cat((get_edge_indices(adj_matrix)[0], self.self_edge_indices), dim=1).to(self.self_edge_indices.device)
         
-        hiddenunits = config.hiddenunits
-        heads_per_layer = self.config.gat_heads_per_layer
+        hiddenunits = self.configuration.model.hidden_layer_size
+        heads_per_layer = self.configuration.model.gat_hidden_layers_heads
 
         GATLayer = GATLayerImp3  # fetch one of 3 available implementations
         heads_per_layer = [1] + heads_per_layer + [1]  # trick - so that I can nicely create GAT layers below
@@ -41,12 +46,12 @@ class GAT(Base):
                 num_in_features=featues_per_layer[i] * heads_per_layer[i],  # consequence of concatenation
                 num_out_features=featues_per_layer[i+1],
                 num_of_heads=heads_per_layer[i+1],
-                config=self.config,
+                configuration=self.configuration,
                 concat=True if i < len(featues_per_layer) - 2 else False,  # last GAT layer does mean avg, the others do concat
                 activation=nn.ELU() if i < len(featues_per_layer) - 2 else None,  # last layer just outputs raw scores
-                dropout_prob=self.config.drop_prob,
-                add_skip_connection=self.config.gat_add_skip_connections,
-                bias=self.config.bias,
+                dropout_prob=self.configuration.training.drop_prob,
+                add_skip_connection=self.configuration.model.gat_skip_connections,
+                bias=self.configuration.model.bias,
                 log_attention_weights=False,
                 name="gat_layer_"+str(i)
             )
@@ -56,18 +61,25 @@ class GAT(Base):
 
     # data is just a (in_nodes_features, topology) tuple, I had to do it like this because of the nn.Sequential:
     # https://discuss.pytorch.org/t/forward-takes-2-positional-arguments-but-3-were-given-for-nn-sqeuential-with-linear-layers/65698
-    def forward(self, attr_matrix, idx):
-        edge_indices = self.edge_indices if self.config.network_effects and not (self.config.train_without_network_effects and self.training) else self.self_edge_indices
+    def forward(self, model_input: ModelInput) -> dict[NetworkMode, ModelOutput]:
+        isolated_input = (model_input.features, self.self_edge_indices)
+        propagated_input = (model_input.features, self.edge_indices)
+        
+        isolated_logits = self.layers(isolated_input)[0].squeeze(0).index_select(
+            dim=-2, index=model_input.indices)
+        propagated_logits = self.layers(propagated_input)[0].squeeze(0).index_select(
+            dim=-2, index=model_input.indices)
 
-        input = (attr_matrix, edge_indices)
-        out, _ = self.layers(input)
-
-        out = out.squeeze(0)
-
-        return out.index_select(dim=-2, index=idx)
-
-    def _transform_features(self, attr_matrix: torch.sparse.FloatTensor):
-        raise NotImplementedError('Not implemented for GAT')
+        return {
+            NetworkMode.ISOLATED: ModelOutput(
+                logits=isolated_logits,
+                softmax_scores=isolated_logits.softmax(-1)
+            ),
+            NetworkMode.PROPAGATED: ModelOutput(
+                logits=propagated_logits,
+                softmax_scores=propagated_logits.softmax(-1)
+            )
+        }
 
 class GATLayer(PyroModule):
     """
@@ -76,11 +88,11 @@ class GATLayer(PyroModule):
 
     head_dim = 1
 
-    def __init__(self, num_in_features, num_out_features, num_of_heads, config, concat=True, activation=nn.ELU(),
+    def __init__(self, num_in_features, num_out_features, num_of_heads, configuration: Configuration, concat=True, activation=nn.ELU(),
                  dropout_prob=0.6, add_skip_connection=True, bias=True, log_attention_weights=False, name=""):
 
         super().__init__(name)
-        self.config = config
+        self.configuration = configuration
 
         # Saving these as we'll need them in forward propagation in children layers (imp1/2/3)
         self.num_of_heads = num_of_heads
@@ -106,7 +118,7 @@ class GATLayer(PyroModule):
         self.linear_proj = Linear(
             input_dim=num_in_features, 
             output_dim=num_of_heads * num_out_features,
-            config=self.config,
+            configuration=self.configuration,
             bias=False,
             activation=lambda x: x,
             dropout=0,
@@ -195,8 +207,8 @@ class GATLayer(PyroModule):
         return out_nodes_features if self.activation is None else self.activation(out_nodes_features)
 
     def pyronize_weights(self):
-        bayesian_linear_proj = self.config.mode in ["P-GAT", "P-PROJ-GAT", "Mixed-GAT", "Mixed-PROJ-GAT"]
-        bayesian_attention = self.config.mode in ["P-GAT", "P-ATT-GAT", "Mixed-GAT", "Mixed-ATT-GAT"]
+        bayesian_linear_proj = self.configuration.model.type in ModelType.gat_bayesian_projection()
+        bayesian_attention = self.configuration.model.type in ModelType.gat_bayesian_projection()
 
         # Linear Projection
         if bayesian_linear_proj:
@@ -205,9 +217,9 @@ class GATLayer(PyroModule):
         # Attention
         if bayesian_attention:
             # Mean
-            self.scoring_fn_target_mean = torch.Tensor(1, self.num_of_heads, self.num_out_features).to(get_device()) + self.config.initial_mean
-            self.scoring_fn_source_mean = torch.Tensor(1, self.num_of_heads, self.num_out_features).to(get_device()) + self.config.initial_mean
-            if self.config.train_mean:
+            self.scoring_fn_target_mean = torch.Tensor(1, self.num_of_heads, self.num_out_features).to(get_device()) + self.configuration.model.initial_mean
+            self.scoring_fn_source_mean = torch.Tensor(1, self.num_of_heads, self.num_out_features).to(get_device()) + self.configuration.model.initial_mean
+            if self.configuration.model.train_mean:
                 self.scoring_fn_target_mean = PyroParam(self.scoring_fn_target_mean)
                 self.scoring_fn_source_mean = PyroParam(self.scoring_fn_source_mean)
 
@@ -215,20 +227,20 @@ class GATLayer(PyroModule):
             nn.init.xavier_uniform_(self.scoring_fn_source_mean)
         
             # Variance
-            self.scoring_fn_target_var = torch.ones([1, self.num_of_heads, self.num_out_features]).to(get_device()) * self.config.initial_var
-            self.scoring_fn_source_var = torch.ones([1, self.num_of_heads, self.num_out_features]).to(get_device()) * self.config.initial_var
-            if self.config.train_var:
+            self.scoring_fn_target_var = torch.ones([1, self.num_of_heads, self.num_out_features]).to(get_device()) * self.configuration.model.initial_var
+            self.scoring_fn_source_var = torch.ones([1, self.num_of_heads, self.num_out_features]).to(get_device()) * self.configuration.model.initial_var
+            if self.configuration.model.train_var:
                 self.scoring_fn_target_var = PyroParam(self.scoring_fn_target_var, constraint=dist.constraints.positive)
                 self.scoring_fn_source_var = PyroParam(self.scoring_fn_source_var, constraint=dist.constraints.positive)
             
             # Weight
-            if self.config.weight_prior == "normal":
+            if self.configuration.model.weight_prior == "normal":
                 self.scoring_fn_target = PyroSample(lambda self: dist.Normal(self.scoring_fn_target_mean, self.scoring_fn_target_var).to_event(2))
                 self.scoring_fn_source = PyroSample(lambda self: dist.Normal(self.scoring_fn_source_mean, self.scoring_fn_source_var).to_event(2))
-            elif self.config.weight_prior == "laplace":
+            elif self.configuration.model.weight_prior == "laplace":
                 self.scoring_fn_target = PyroSample(lambda self: dist.Laplace(self.scoring_fn_target_mean, self.scoring_fn_target_var).to_event(2))
                 self.scoring_fn_source = PyroSample(lambda self: dist.Laplace(self.scoring_fn_source_mean, self.scoring_fn_source_var).to_event(2))
-            elif self.config.weight_prior == "none":
+            elif self.configuration.model.weight_prior == "none":
                 self.scoring_fn_target = self.scoring_fn_target_mean
                 self.scoring_fn_source = self.scoring_fn_source_mean
             else:
@@ -283,11 +295,11 @@ class GATLayerImp3(GATLayer):
     nodes_dim = 1      # node dimension/axis
     head_dim = 2      # attention head dimension/axis
 
-    def __init__(self, num_in_features, num_out_features, num_of_heads, config, concat=True, activation=nn.ELU(),
+    def __init__(self, num_in_features, num_out_features, num_of_heads, configuration: Configuration, concat=True, activation=nn.ELU(),
                  dropout_prob=0.6, add_skip_connection=True, bias=True, log_attention_weights=False, name=""):
 
         # Delegate initialization to the base class
-        super().__init__(num_in_features, num_out_features, num_of_heads, config, concat, activation, dropout_prob,
+        super().__init__(num_in_features, num_out_features, num_of_heads, configuration, concat, activation, dropout_prob,
                       add_skip_connection, bias, log_attention_weights, name)
 
     def forward(self, data):

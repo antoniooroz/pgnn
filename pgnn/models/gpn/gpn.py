@@ -8,22 +8,32 @@
 
 import datetime
 from typing import Dict, Tuple, List
+from pgnn.base.network_mode import NetworkMode
+import pgnn.base.network_uncertainty_combination as NUC
+from pgnn.base.base import Base
+from pgnn.configuration.model_configuration import ModelType
+
+from pgnn.configuration.training_configuration import Phase
+from pgnn.data.model_input import ModelInput
+from pgnn.result.model_output import GPNModelOutput, ModelOutput
+from pgnn.result.result import NetworkModeResult, Results
 from .gpn_fns.utils.config import ModelConfiguration
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import torch_geometric.utils as tu
-from torch_geometric.data import Data
+from pgnn.data.data import Data
 from .gpn_fns.nn import uce_loss, entropy_reg
 from .gpn_fns.layers import APPNPPropagation, LinearSequentialLayer
 from .gpn_fns.utils import apply_mask
-from .gpn_fns.utils import Prediction, ModelConfiguration
-from .gpn_fns.layers import Density, Evidence, ConnectedComponents
+from pgnn.configuration import Configuration
+from .gpn_fns.utils import Prediction
+from .gpn_fns.layers import Density, Evidence
 from .gpn_fns.model import Model
 import numpy as np
 
-from ...utils.utils import config_to_dict, get_statistics, get_device, get_edge_indices, escape_slashes
+from ...utils.utils import get_statistics, get_device, get_edge_indices, escape_slashes
 import os
 import copy
 
@@ -31,8 +41,10 @@ import copy
 class GPN(Model):
     """Graph Posterior Network model"""
 
-    def __init__(self, params: ModelConfiguration, graph, training_labels, config):
-        super().__init__(params)
+    def __init__(self, nfeatures, nclasses, configuration: Configuration, adj_matrix, training_labels):
+        configuration.model.gpn_model['dim_features'] = nfeatures
+        configuration.model.gpn_model['num_classes'] = nclasses
+        super().__init__(ModelConfiguration(**configuration.model.gpn_model))
 
         if self.params.num_layers is None:
             num_layers = 0
@@ -74,25 +86,24 @@ class GPN(Model):
             cached=False,
             normalization='sym')
         
-        self.graph = graph
-        self.edge_indices, self.edge_weights = get_edge_indices(self.graph.adj_matrix)
+        self.edge_indices, self.edge_weights = get_edge_indices(adj_matrix)
         self.training_labels = training_labels
-        self.config = config
+        self.configuration: Configuration = configuration
 
         assert self.params.pre_train_mode in ('encoder', 'flow', None)
         assert self.params.likelihood_type in ('UCE', 'nll_train', 'nll_train_and_val', 'nll_consistency', None)
 
-    def forward(self, attr_matrix: torch.sparse.FloatTensor, idx: torch.LongTensor, y = None) -> Prediction:
-        return self.forward_impl(attr_matrix, idx, y)
+    def forward(self, model_input: ModelInput) -> dict[NetworkMode, GPNModelOutput]:
+        return self.forward_impl(model_input)
 
-    def forward_impl(self, attr_matrix: torch.sparse.FloatTensor, idx: torch.LongTensor, y = None) -> Prediction:
+    def forward_impl(self, model_input: ModelInput) -> dict[NetworkMode, GPNModelOutput]:
         edge_index = self.edge_indices
-        h = self.input_encoder(attr_matrix)
+        h = self.input_encoder(model_input.features)
         z = self.latent_encoder(h)
 
         # compute feature evidence (with Normalizing Flows)
         # log p(z, c) = log p(z | c) p(c)
-        p_c = self.get_class_probalities(attr_matrix, idx)
+        p_c = self.get_class_probabilities(model_input.features, model_input.indices)
         log_q_ft_per_class = self.flow(z) + p_c.view(1, -1).log()
 
         if '-plus-classes' in self.params.alpha_evidence_scale:
@@ -115,7 +126,7 @@ class GPN(Model):
         
         log_soft = soft.log()
         
-        max_soft_iso, _ = soft_iso.max(dim=-1)
+        max_soft_iso, hard_iso = soft_iso.max(dim=-1)
         max_soft, hard = soft.max(dim=-1)
 
         # ---------------------------------------------------------------------------------
@@ -151,7 +162,22 @@ class GPN(Model):
         )
         # ---------------------------------------------------------------------------------
 
-        return pred
+        return {
+            NetworkMode.PROPAGATED: GPNModelOutput(
+                alpha=alpha[model_input.indices],
+                softmax_scores=soft[model_input.indices],
+                predicted_classes=hard[model_input.indices],
+                epistemic_uncertainties=pred.sample_confidence_epistemic[model_input.indices],
+                aleatoric_uncertainties=pred.sample_confidence_aleatoric[model_input.indices]
+            ),
+            NetworkMode.ISOLATED: GPNModelOutput(
+                alpha=alpha_features[model_input.indices],
+                softmax_scores=soft_iso[model_input.indices],
+                predicted_classes=hard_iso[model_input.indices],
+                epistemic_uncertainties=pred.sample_confidence_features[model_input.indices],
+                aleatoric_uncertainties=pred.sample_confidence_aleatoric_isolated[model_input.indices]
+            )
+        }
 
     def get_optimizer(self, lr: float, weight_decay: float) -> List[optim.Adam]:
         flow_lr = lr if self.params.factor_flow_lr is None else self.params.factor_flow_lr * lr
@@ -186,45 +212,39 @@ class GPN(Model):
     def get_finetune_optimizer(self, lr: float, weight_decay: float) -> List[optim.Adam]:
         # similar to warmup
         return [self.get_warmup_optimizer(lr, weight_decay)]
-    
-    def set_optimizers(self):
-        self.optimizers = []
-        for era in range(self.config.number_of_eras):
-            if self.config.optimizers[era] == "warmup":
-                optimizer_list = self.get_warmup_optimizer(self.config.learning_rate[era], self.config.reg_lambda[era])
-            elif self.config.optimizers[era] == "training":
-                optimizer_list = self.get_optimizer(self.config.learning_rate[era], self.config.reg_lambda[era])
-            elif self.config.optimizers[era] == "finetune":
-                optimizer_list = self.get_finetune_optimizer(self.config.learning_rate[era], self.config.reg_lambda[era])
-            else:
-                raise NotImplementedError()
-            self.optimizers.append(optimizer_list)
 
-    def uce_loss(self, prediction: Prediction, idx, labels, approximate=True) -> Tuple[torch.Tensor, torch.Tensor]:
+    def uce_loss(self, model_output: GPNModelOutput, data: Data, approximate=True) -> Tuple[torch.Tensor, torch.Tensor]:
         #alpha_train, y = apply_mask(idx, labels, prediction.alpha, split='train')
-        alpha_train = prediction.alpha[idx]
+        alpha_train = model_output.alpha
         reg = self.params.entropy_reg
-        return uce_loss(alpha_train, labels, reduction='sum'), \
+        return uce_loss(alpha_train, data.labels, reduction='sum'), \
             entropy_reg(alpha_train, reg, approximate=approximate, reduction='sum')
 
-    def loss(self, prediction: Prediction, idx, labels) -> Dict[str, torch.Tensor]:
-        uce, reg = self.uce_loss(prediction, idx, labels)
-        n_train = idx.shape[0] if self.params.loss_reduction == 'mean' else 1
+    def loss(self, model_output: GPNModelOutput, data: Data) -> Dict[str, torch.Tensor]:
+        uce, reg = self.uce_loss(model_output, data)
+        n_train = data.model_input.indices.shape[0] if self.params.loss_reduction == 'mean' else 1
         return {'UCE': uce / n_train, 'REG': reg / n_train}
 
-    def warmup_loss(self, prediction: Prediction, idx, labels) -> Dict[str, torch.Tensor]:
+    def warmup_loss(self, model_output: GPNModelOutput, data: Data) -> Dict[str, torch.Tensor]:
         if self.params.pre_train_mode == 'encoder':
-            return self.CE_loss(prediction, idx, labels)
+            return self.CE_loss(model_output, data)
 
-        return self.loss(prediction, idx, labels)
+        return self.loss(model_output, data)
+    
+    def CE_loss(self, model_output: GPNModelOutput, data: Data, reduction='mean') -> Dict[str, torch.Tensor]:
+        y_hat = model_output.softmax_scores.log()
 
-    def finetune_loss(self, prediction: Prediction, idx, labels) -> Dict[str, torch.Tensor]:
-        return self.warmup_loss(prediction, idx, labels)
+        return {
+            'CE': F.nll_loss(y_hat, data.labels, reduction=reduction)
+        }
 
-    def likelihood(self, prediction: Prediction, idx, labels) -> Dict[str, torch.Tensor]:
+    def finetune_loss(self, model_output: GPNModelOutput, data: Data) -> Dict[str, torch.Tensor]:
+        return self.warmup_loss(model_output, data)
+
+    def likelihood(self, model_output: GPNModelOutput, data: Data) -> Dict[str, torch.Tensor]:
         raise NotImplementedError
 
-    def get_class_probalities(self, attr_matrix: torch.sparse.FloatTensor, idx: torch.LongTensor) -> torch.Tensor:
+    def get_class_probabilities(self, attr_matrix: torch.sparse.FloatTensor, idx: torch.LongTensor) -> torch.Tensor:
         l_c = torch.zeros(self.params.num_classes, device=attr_matrix.device)
         y_train = self.training_labels
 
@@ -239,72 +259,73 @@ class GPN(Model):
         return p_c
     
     # Compability Functions
-    def get_predictions(self, attr_matrix, idx):
-        prediction = self.forward(attr_matrix, idx)
-
-        epist = prediction.sample_confidence_epistemic[idx] if self.config.network_effects else prediction.sample_confidence_features[idx]
-
-        alea = prediction.sample_confidence_aleatoric[idx] if self.config.network_effects else prediction.sample_confidence_aleatoric_isolated[idx]
-
-        return prediction.soft[idx], prediction.hard[idx], epist, alea
+    def predict(self, model_input: ModelInput) -> dict[NetworkMode, GPNModelOutput]:
+        model_outputs: dict[NetworkMode, GPNModelOutput] = self.forward(model_input)
+        
+        NUC.combine(
+            combinationMethod=self.configuration.model.network_combination,
+            model_outputs=model_outputs
+        )
+        
+        return model_outputs
     
-    def training_init(self, pytorch_seed, date_time_str, iteration, data_seed):
+    def init(self, pytorch_seed, date_time_str, iteration, data_seed):
         torch.manual_seed(seed=pytorch_seed)
-        self.set_optimizers()
         self.pytorch_seed = pytorch_seed
         self.date_time_str = date_time_str
         self.iteration = iteration
         self.data_seed = data_seed
+        
+        self.optimizer = {
+            Phase.WARMUP: self.get_warmup_optimizer(self.configuration.training.learning_rate[Phase.WARMUP], self.configuration.training.reg_lambda[Phase.WARMUP]),
+            Phase.TRAINING: self.get_optimizer(self.configuration.training.learning_rate[Phase.TRAINING], self.configuration.training.reg_lambda[Phase.TRAINING])
+        }
     
-    def get_loss(self, attr_mat_norm, idx, labels, oods):
-        self.set_eval(True)
-        id_idx = idx[oods==0]
-        id_labels = labels[oods==0]
-        prediction = self.forward(attr_mat_norm, id_idx) 
+    def step(self, phase: Phase, data: Data) -> Results:
+        is_training = phase in Phase.training_phases()
+        self.set_eval(not is_training)
+        if is_training:
+            for optimizer in self.optimizer[phase]:
+                optimizer.zero_grad()
         
-        loss = torch.zeros([1], device=attr_mat_norm.device)
-        for key, val in self.loss(prediction, id_idx, id_labels).items():
-            loss += val
+        id_data = Data(
+            model_input=ModelInput(
+                features=data.model_input.features,
+                indices=data.model_input.indices[data.ood_indicators==0]
+            ),
+            labels=data.labels[data.ood_indicators==0]
+        )
+        train_model_outputs = self.forward(id_data.model_input) 
+        loss = torch.zeros([1], device=get_device())
         
-        return loss
-    
-    def training_step(self, phase, attr_mat_norm, idx, labels, oods):
-        self.set_eval(phase != "train")
-        self.optimizers_zero_grad()
-        
-        id_idx = idx[oods==0]
-        id_labels = labels[oods==0]
-        prediction = self.forward(attr_mat_norm, id_idx) 
-        loss = torch.zeros([1], device=attr_mat_norm.device)
-        
-        if phase == "train":
-            loss_dict = self.loss(prediction, id_idx, id_labels)
-            for key, val in loss_dict.items():
-                loss += val
+        if is_training:
+            loss_dict = self.loss(train_model_outputs[NetworkMode.PROPAGATED], id_data)
+            for loss_item in loss_dict.values():
+                loss += loss_item
             loss.backward()
-            self.optimizers_step()   
+            for optimizer in self.optimizer[phase]:
+                optimizer.step()
         else:
-            loss = F.nll_loss(prediction.log_soft[id_idx], id_labels, reduction=self.params.loss_reduction).cpu().detach()    
+            loss = F.nll_loss(train_model_outputs[NetworkMode.PROPAGATED].softmax_scores.log(), id_data.labels, reduction=self.params.loss_reduction).cpu().detach()    
         
-        probs, preds, confidence_all, confidence_correct, confidence_false, datapoints_correct, datapoints_false = get_statistics(self, attr_mat_norm, idx, labels, oods)
+        model_outputs = self.predict(data.model_input)
+        results = Results()
+            
+        for network_mode in model_outputs.keys():
+            model_output = model_outputs[network_mode]
+                
+            results.networkModeResults[network_mode] = NetworkModeResult(
+                model_output=model_output,
+                loss=loss if network_mode==NetworkMode.PROPAGATED else 0,
+                data=data
+            )
         
-        return loss, probs, confidence_all, confidence_correct, confidence_false, datapoints_correct, datapoints_false
+        return results
     
-    def optimizers_zero_grad(self):
-        optimizers_for_era = self.optimizers[self.era]
-        for optimizer in optimizers_for_era:
-            optimizer.zero_grad()
-
-    def optimizers_step(self):
-        optimizers_for_era = self.optimizers[self.era]
-        for optimizer in optimizers_for_era:
-            optimizer.step()
-    
-    def custom_state_dict(self, acc):
+    def custom_state_dict(self):
         return {
             'model': copy.deepcopy(self.state_dict()),
-            'config': copy.deepcopy(config_to_dict(self.config)),
-            'stopping_acc': copy.deepcopy(acc),
+            'config': copy.deepcopy(self.configuration.to_dict()),
             'torch_seed': copy.deepcopy(self.pytorch_seed),
             'data_seed': copy.deepcopy(self.data_seed),
             'iteration': copy.deepcopy(self.iteration),
@@ -313,41 +334,44 @@ class GPN(Model):
 
     def save_model(self, custom_state_dict = None):
         if custom_state_dict is None:
-            custom_state_dict = self.custom_state_dict(None)
-        torch.save(custom_state_dict, escape_slashes(os.getcwd() + '/saved_models/' +  'GPN [' + self.date_time_str + '] [' + str(self.data_seed) + '] [' + str(self.iteration) + ']' + '.save'))
+            custom_state_dict = self.custom_state_dict()
+        torch.save(custom_state_dict, escape_slashes(
+            Base.SAVE_FILE_NAME.format(
+                dir=os.getcwd(),
+                mode=self.configuration.model.type.name,
+                name=self.configuration.custom_name,
+                seed=self.data_seed,
+                iter=self.iteration
+            )))
     
-    def load_model_from_state_dict(self, state_dict, attr_mat):
-        self.training_init(state_dict["torch_seed"], state_dict["date_time"], state_dict["iteration"], state_dict["data_seed"])
+    def load_custom_state_dict(self, state_dict):
+        self.init(
+            pytorch_seed=state_dict["torch_seed"], 
+            model_name=state_dict["model_name"],
+            iteration=state_dict["iteration"], 
+            data_seed=state_dict["data_seed"]
+        )
         self.load_state_dict(state_dict['model'])
     
-    def load_model(self, name, attr_mat):
-        state_dict = torch.load(escape_slashes(os.getcwd() + '/saved_models/' + name, map_location=get_device()))
-        self.load_model_from_state_dict(state_dict, attr_mat)
+    def load_model(self, mode: ModelType, name: str, seed: int, iter: int):
+        state_dict = torch.load(escape_slashes(
+            Base.SAVE_FILE_NAME.format(
+                dir=os.getcwd(),
+                mode=mode.value,
+                name=name,
+                seed=seed,
+                iter=iter
+            )), map_location=get_device())
+        self.load_custom_state_dict(state_dict)
     
     def set_eval(self, eval = True):
         if eval:
             self.eval()
-            torch.set_grad_enabled(False)
         else:
             self.train()
-            torch.set_grad_enabled(True)
+        torch.set_grad_enabled(not eval)
     
     def log_weights(self):
         return {}
-    
-    def set_era(self, era):
-        self.era = era
-        
-        if self.config.optimizers[self.era] == "warmup":
-            self.set_warming_up(True)
-            self.set_finetuning(False)
-        elif self.config.optimizers[self.era] == "training":
-            self.set_warming_up(False)
-            self.set_finetuning(False)
-        elif self.config.optimizers[self.era] == "finetune":
-            self.set_warming_up(False)
-            self.set_finetuning(True)
-        else:
-            raise NotImplementedError()
     
         

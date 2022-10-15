@@ -9,9 +9,14 @@ def get_stats_for_column(table, column_name, logging_prefix):
     seeds = table.get_column("seed", convert_to="numpy")
 
     mean, standard_deviation = _calculate_mean_and_standard_deviation(column_data)
-        
-    max_idx = np.argmax(column_data)
-    min_idx = np.argmin(column_data)
+    
+    if column_data.dtype != 'object':
+        max_idx = np.argmax(column_data)
+        min_idx = np.argmin(column_data)
+    else:
+        max_idx = 0
+        min_idx = 0
+    
     return {
         "mean/" + logging_prefix: mean,
         "std/" + logging_prefix: standard_deviation,
@@ -87,8 +92,12 @@ def ood_final_stats(prefix, stats):
     return logs
 
 def _calculate_mean_and_standard_deviation(values):
-    values = torch.FloatTensor(values)
-    mean = values.mean()
-    standard_deviation = torch.sqrt(torch.sum(torch.square(values - mean)) / values.shape[0])
+    if values.dtype != 'object':
+        values = torch.FloatTensor(values)
+        mean = values.mean()
+        standard_deviation = torch.sqrt(torch.sum(torch.square(values - mean)) / values.shape[0])
+        
+        return mean.item(), standard_deviation.item()
+    else:
+        return None, None
     
-    return mean.item(), standard_deviation.item()

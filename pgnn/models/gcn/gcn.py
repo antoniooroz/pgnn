@@ -6,55 +6,72 @@
 # URL: https://github.com/tkipf/gcn
 ##############################################################
 
+from pyexpat import model
 from typing import List
 import torch
 import torch.nn as nn
+from pgnn.base.network_mode import NetworkMode
+from pgnn.configuration.configuration import Configuration
+from pgnn.configuration.model_configuration import ModelType
+from pgnn.data import model_input
+from pgnn.data.model_input import ModelInput
+from pgnn.result.model_output import ModelOutput
 
 from pgnn.utils import edge_dropout, get_device, preprocess_adj
 from pgnn.base import GraphConvolution, Base
 
 class GCN(Base):
-    def __init__(self, nfeatures: int, nclasses: int, config, hiddenunits: List[int], drop_prob: float, adj_matrix):
+    def __init__(self, nfeatures: int, nclasses: int, configuration: Configuration, adj_matrix: torch.Tensor):
         super().__init__()
-        self.config = config
+        self.configuration = configuration
         self.nclasses = nclasses
         self.nfeatures = nfeatures
 
-        self.original_adj_matrix = adj_matrix.toarray()
-        self.preprocessed_adj_matrix = torch.tensor(preprocess_adj(adj_matrix, laplacian=True).toarray()).type(torch.float32).to(get_device())
+        self.original_adj_matrix = adj_matrix
+        
+        self.preprocessed_adj_matrix = preprocess_adj(adj_matrix, laplacian=True).type(torch.float32).to(get_device())
+        
         self.isolated_adj_matrix = torch.eye(self.original_adj_matrix.shape[0]).type(torch.float32).to(get_device())
 
-        hiddenunits = [nfeatures] + hiddenunits + [nclasses]
+        hiddenunits = [nfeatures] + self.configuration.model.hidden_layer_size + [nclasses]
 
         layers = []
         for i in range(len(hiddenunits)-1):            
             layers.append(GraphConvolution(
                 input_dim=hiddenunits[i], 
                 output_dim=hiddenunits[i+1],
-                config=config,  
-                bias=self.config.bias,
+                configuration=configuration,  
+                bias=self.configuration.model.bias,
                 activation=nn.ReLU() if i < len(hiddenunits)-2 else lambda x: x,
-                dropout=drop_prob if (i>0 or not self.config.disable_dropout_on_input) else 0,
+                dropout=self.configuration.training.drop_prob,
                 name="layer"+str(i)
-                ))
+            ))
 
         self.layers = nn.Sequential(*layers)
 
-    def forward(self, attr_matrix: torch.sparse.FloatTensor, idx: torch.LongTensor):
-        if self.config.network_effects and not (self.config.train_without_network_effects and self.training):
-            support = self.adj_matrix_with_edge_dropout()
-        else:
-            support = self.isolated_adj_matrix
+    def forward(self, model_input: ModelInput) -> dict[NetworkMode, ModelOutput]:
+        isolated_input = (model_input.features, self.isolated_adj_matrix)
+        propagated_input = (model_input.features, self.get_adj_matrix())
 
-        input = (attr_matrix, support)
+        isolated_logits = self.layers(isolated_input)[0].index_select(
+            dim=-2, index=model_input.indices)
+        propagated_logits = self.layers(propagated_input)[0].index_select(
+            dim=-2, index=model_input.indices)
 
-        local_logits, _ = self.layers(input)
-        final_logits = local_logits.index_select(dim=-2, index=idx)
+        return {
+            NetworkMode.ISOLATED: ModelOutput(
+                logits=isolated_logits,
+                softmax_scores=isolated_logits.softmax(-1)
+            ),
+            NetworkMode.PROPAGATED: ModelOutput(
+                logits=propagated_logits,
+                softmax_scores=propagated_logits.softmax(-1)
+            )
+        }
 
-        return final_logits
-
-    def adj_matrix_with_edge_dropout(self):
-        if self.config.edge_drop_prob > 0 and self.config.mode == "DE-GCN":
-            return torch.tensor(preprocess_adj(edge_dropout(self.original_adj_matrix, self.config.edge_drop_prob), laplacian=True).toarray()).type(torch.float32).to(get_device())
+    def get_adj_matrix(self):
+        if self.configuration.training.edge_drop_prob > 0 and self.configuration.model.type == ModelType.DE_GCN:
+            adj_dropped = edge_dropout(self.original_adj_matrix, self.configuration.training.edge_drop_prob)
+            return preprocess_adj(adj_dropped, laplacian=True).type(torch.float32).to(get_device())
         else:
             return self.preprocessed_adj_matrix
